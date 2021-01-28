@@ -9,7 +9,7 @@ import torch
 import torch.utils.model_zoo as model_zoo
 import torch.distributed as dist
 
-from engine.logger import get_logger
+from furnace.engine.logger import get_logger
 
 logger = get_logger()
 

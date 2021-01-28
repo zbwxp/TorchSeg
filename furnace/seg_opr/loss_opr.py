@@ -5,8 +5,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from engine.logger import get_logger
-from seg_opr.seg_oprs import one_hot
+from furnace.engine.logger import get_logger
+from furnace.seg_opr.seg_oprs import one_hot
 
 logger = get_logger()
 
@@ -78,9 +78,11 @@ class ProbOhemCrossEntropy2d(nn.Module):
         if self.min_kept > num_valid:
             logger.info('Labels: {}'.format(num_valid))
         elif num_valid > 0:
-            prob = prob.masked_fill_(1 - valid_mask, 1)
-            mask_prob = prob[
-                target, torch.arange(len(target), dtype=torch.long)]
+            # RuntimeError: Subtraction, the `-` operator, with a bool tensor is not supported.
+            # If you are trying to invert a mask, use the `~` or `logical_not()` operator instead.
+            # prob = prob.masked_fill_(1 - valid_mask, 1)
+            prob = prob.masked_fill_(torch.logical_not(valid_mask), 1)
+            mask_prob = prob[target, torch.arange(len(target), dtype=torch.long)]
             threshold = self.thresh
             if self.min_kept > 0:
                 _, index = torch.sort(mask_prob)
@@ -92,7 +94,7 @@ class ProbOhemCrossEntropy2d(nn.Module):
                 valid_mask = valid_mask * kept_mask
                 # logger.info('Valid Mask: {}'.format(valid_mask.sum()))
 
-        target = target.masked_fill_(1 - valid_mask, self.ignore_label)
+        target = target.masked_fill_(torch.logical_not(valid_mask), self.ignore_label)
         target = target.view(b, h, w)
 
         return self.criterion(pred, target)

@@ -3,6 +3,8 @@ import os.path as osp
 import sys
 import argparse
 from tqdm import tqdm
+import numpy as np
+import random
 
 import torch
 import torch.nn as nn
@@ -12,14 +14,12 @@ import torch.backends.cudnn as cudnn
 
 from config import config
 from dataloader import get_train_loader
-from network import BiSeNet
+from network import BiSeNetV2
 from furnace.datasets import Cityscapes
-
 from furnace.utils.init_func import init_weight, group_weight
-from furnace.utils.pyt_utils import all_reduce_tensor
-from furnace.engine.lr_policy import PolyLR
+from furnace.engine.lr_policy import PolyLR  #WarmupPolyLR
 from furnace.engine.engine import Engine
-from furnace.seg_opr.loss_opr import SigmoidFocalLoss, ProbOhemCrossEntropy2d
+from furnace.seg_opr.loss_opr import ProbOhemCrossEntropy2d
 
 try:
     from apex.parallel import DistributedDataParallel, SyncBatchNorm
@@ -32,56 +32,44 @@ parser = argparse.ArgumentParser()
 with Engine(custom_parser=parser) as engine:
     args = parser.parse_args()
 
-    cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    if not engine.distributed:
+        engine.local_rank = 0
 
-    seed = config.seed
-    if engine.distributed:
-        seed = engine.local_rank
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
+    torch.manual_seed(config.seed + engine.local_rank)
+    torch.cuda.manual_seed(config.seed + engine.local_rank)
+    torch.cuda.manual_seed_all(config.seed + engine.local_rank)
+    np.random.seed(seed=config.seed + engine.local_rank)
+    random.seed(config.seed + engine.local_rank)
 
     # data loader
     train_loader, train_sampler = get_train_loader(engine, Cityscapes)
 
-    # config network and criterion
-    min_kept = int(config.batch_size // len(
-        engine.devices) * config.image_height * config.image_width // 16)
+    min_kept = 100000
     criterion = ProbOhemCrossEntropy2d(ignore_label=255, thresh=0.7,
                                        min_kept=min_kept,
                                        use_weight=False)
 
     if engine.distributed:
         BatchNorm2d = SyncBatchNorm
-
-    model = BiSeNet(config.num_classes, is_training=True,
-                    criterion=criterion,
-                    pretrained_model=config.pretrained_model,
-                    norm_layer=BatchNorm2d)
-    init_weight(model.business_layer, nn.init.kaiming_normal_,
-                BatchNorm2d, config.bn_eps, config.bn_momentum,
-                mode='fan_in', nonlinearity='relu')
+    else:
+        BatchNorm2d = nn.BatchNorm2d
+    model = BiSeNetV2(config.num_classes, is_training=True, criterion=criterion,
+                      norm_layer=BatchNorm2d)
 
     # group weight and config optimizer
     base_lr = config.lr
-    # if engine.distributed:
-    #     base_lr = config.lr * engine.world_size
 
     params_list = []
-    params_list = group_weight(params_list, model.context_path,
+    params_list = group_weight(params_list, model.semantic_branch,
                                BatchNorm2d, base_lr)
-    params_list = group_weight(params_list, model.spatial_path,
-                               BatchNorm2d, base_lr * 10)
-    params_list = group_weight(params_list, model.global_context,
-                               BatchNorm2d, base_lr * 10)
-    params_list = group_weight(params_list, model.arms,
-                               BatchNorm2d, base_lr * 10)
-    params_list = group_weight(params_list, model.refines,
-                               BatchNorm2d, base_lr * 10)
-    params_list = group_weight(params_list, model.heads,
-                               BatchNorm2d, base_lr * 10)
-    params_list = group_weight(params_list, model.ffm,
-                               BatchNorm2d, base_lr * 10)
+    params_list = group_weight(params_list, model.detail_branch,
+                               BatchNorm2d, base_lr)
+    params_list = group_weight(params_list, model.ffm, BatchNorm2d,
+                               base_lr)
+    params_list = group_weight(params_list, model.heads, BatchNorm2d,
+                               base_lr)
 
     optimizer = torch.optim.SGD(params_list,
                                 lr=base_lr,
@@ -89,14 +77,21 @@ with Engine(custom_parser=parser) as engine:
                                 weight_decay=config.weight_decay)
 
     # config lr policy
-    total_iteration = config.nepochs * config.niters_per_epoch
+    warm_iteration = config.warm_epochs * config.niters_per_epoch
+    total_iteration = config.nepochs * config.niters_per_epoch + warm_iteration
+    # lr_policy = WarmupPolyLR(config.warm_lr, warm_iteration, base_lr,
+    #                          config.lr_power, total_iteration)
     lr_policy = PolyLR(base_lr, config.lr_power, total_iteration)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
 
     if engine.distributed:
-        model = DistributedDataParallel(model)
+        if torch.cuda.is_available():
+            model.cuda()
+            model = DistributedDataParallel(model)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # model = DataParallelModel(model, device_ids=engine.devices)
+        model.to(device)
 
     engine.register_state(dataloader=train_loader, model=model,
                           optimizer=optimizer)
@@ -105,7 +100,8 @@ with Engine(custom_parser=parser) as engine:
 
     model.train()
 
-    for epoch in range(engine.state.epoch, config.nepochs):
+    total_epochs = config.nepochs + config.warm_epochs
+    for epoch in range(engine.state.epoch, total_epochs):
         if engine.distributed:
             train_sampler.set_epoch(epoch)
         bar_format = '{desc}[{elapsed}<{remaining},{rate_fmt}]'
@@ -127,27 +123,30 @@ with Engine(custom_parser=parser) as engine:
 
             # reduce the whole loss over multi-gpu
             if engine.distributed:
-                reduce_loss = all_reduce_tensor(loss,
-                                                world_size=engine.world_size)
+                reduced_loss = loss.clone()
+                dist.all_reduce(reduced_loss, dist.ReduceOp.SUM)
+                reduced_loss.div_(engine.world_size)
+            else:
+                reduced_loss = loss.clone()
 
             current_idx = epoch * config.niters_per_epoch + idx
             lr = lr_policy.get_lr(current_idx)
 
-            for i in range(2):
+            for i in range(len(optimizer.param_groups)):
                 optimizer.param_groups[i]['lr'] = lr
-            for i in range(2, len(optimizer.param_groups)):
-                optimizer.param_groups[i]['lr'] = lr * 10
+            # for i in range(6, len(optimizer.param_groups)):
+            #     optimizer.param_groups[i]['lr'] = lr
 
             loss.backward()
             optimizer.step()
-            print_str = 'Epoch{}/{}'.format(epoch, config.nepochs) \
+            print_str = 'Epoch{}/{}'.format(epoch, total_epochs) \
                         + ' Iter{}/{}:'.format(idx + 1, config.niters_per_epoch) \
                         + ' lr=%.2e' % lr \
-                        + ' loss=%.2f' % reduce_loss.item()
+                        + ' loss=%.2f' % reduced_loss.item()
 
             pbar.set_description(print_str, refresh=False)
 
-        if (epoch > config.nepochs - 20) or (epoch % config.snapshot_iter == 0):
+        if (epoch > total_epochs - 20) or (epoch % config.snapshot_iter == 0):
             if engine.distributed and (engine.local_rank == 0):
                 engine.save_and_link_checkpoint(config.snapshot_dir,
                                                 config.log_dir,

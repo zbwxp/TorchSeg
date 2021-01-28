@@ -14,7 +14,7 @@ import torch.distributed as dist
 
 from .logger import get_logger
 from .version import __version__
-from utils.pyt_utils import load_model, parse_devices, extant_file, link_file, \
+from furnace.utils.pyt_utils import load_model, parse_devices, extant_file, link_file, \
     ensure_dir
 
 logger = get_logger()
